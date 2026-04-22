@@ -165,9 +165,23 @@ INDEX_HTML = """<!doctype html>
 """
 
 
+class QuietHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        # silencia desconexões normais do navegador (SSE fecha a conexão ao recarregar)
+        pass
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args, **kwargs) -> None:
         pass
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            self.close_connection = True
 
     def do_GET(self) -> None:
         if self.path == "/":
@@ -211,7 +225,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def http_server() -> None:
-    srv = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
+    srv = QuietHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
     srv.serve_forever()
 
 
