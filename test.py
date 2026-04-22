@@ -1,5 +1,6 @@
 import json
 import queue
+import re
 import sys
 import tempfile
 import threading
@@ -25,29 +26,43 @@ translator = GoogleTranslator(source="en", target="pt")
 
 
 def is_hallucination(text: str) -> bool:
-    """Detecta loops típicos de Whisper ('make sure that we make sure that...').
+    """Detecta loops típicos de Whisper ('Sum of Sum of...', 'make sure that we make sure...').
 
-    Critérios: baixa diversidade de palavras OU n-gramas curtos muito repetidos.
+    Critérios: baixa diversidade de palavras OU n-gramas curtos muito repetidos
+    OU repetição imediata consecutiva do mesmo trecho.
     """
     words = text.lower().split()
-    if len(words) < 12:
+    if len(words) < 4:
         return False
 
-    # diversidade: únicas / total. loops costumam ficar abaixo de 0.25
+    # repetição imediata: o mesmo bloco de 1–4 palavras aparece ≥3x em sequência
+    # pega casos curtos tipo "sum of sum of sum of"
+    for n in (1, 2, 3, 4):
+        if len(words) < n * 3:
+            continue
+        for i in range(len(words) - n * 3 + 1):
+            block = words[i:i + n]
+            if words[i + n:i + 2 * n] == block and words[i + 2 * n:i + 3 * n] == block:
+                return True
+
+    if len(words) < 8:
+        return False
+
+    # diversidade: únicas / total. loops costumam ficar em 0.25 ou abaixo
     unique_ratio = len(set(words)) / len(words)
-    if unique_ratio < 0.25:
+    if unique_ratio <= 0.3:
         return True
 
     # repetição de n-gramas de 2–4 palavras
     for n in (2, 3, 4):
-        if len(words) < n * 4:
+        if len(words) < n * 3:
             continue
         grams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
         counts: dict[tuple, int] = {}
         for g in grams:
             counts[g] = counts.get(g, 0) + 1
         top = max(counts.values())
-        if top >= 4 and top / len(grams) > 0.35:
+        if top >= 3 and top / len(grams) > 0.3:
             return True
 
     return False
@@ -123,6 +138,18 @@ INDEX_HTML = """<!doctype html>
   .msg .en { color: #94a3b8; font-size: 13px; line-height: 1.4; }
   .msg .pt { color: #f1f5f9; font-size: 15px; line-height: 1.45; margin-top: 4px; }
   .msg .time { color: #64748b; font-size: 11px; margin-top: 6px; }
+  .tag {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .5px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .tag.en { background: #1e3a8a; color: #bfdbfe; }
+  .tag.pt { background: #14532d; color: #bbf7d0; }
   @keyframes slideIn {
     from { opacity: 0; transform: translateY(8px); }
     to   { opacity: 1; transform: translateY(0); }
@@ -151,8 +178,12 @@ INDEX_HTML = """<!doctype html>
       if (empty) empty.remove();
       const div = document.createElement('div');
       div.className = 'msg';
-      const en = document.createElement('div'); en.className = 'en'; en.textContent = ev.en;
-      const pt = document.createElement('div'); pt.className = 'pt'; pt.textContent = ev.pt;
+      const en = document.createElement('div'); en.className = 'en';
+      en.innerHTML = '<span class="tag en">EN</span>';
+      en.appendChild(document.createTextNode(ev.en));
+      const pt = document.createElement('div'); pt.className = 'pt';
+      pt.innerHTML = '<span class="tag pt">PT-BR</span>';
+      pt.appendChild(document.createTextNode(ev.pt));
       const tm = document.createElement('div'); tm.className = 'time'; tm.textContent = fmt(ev.ts * 1000);
       div.append(en, pt, tm);
       msgs.prepend(div);
@@ -269,9 +300,20 @@ def worker():
                 path_or_hf_repo=MODEL_REPO,
                 language="en",
                 task="transcribe",
+                # não suprime nenhum token — mantém palavrões e gírias como falados
+                suppress_tokens=[],
+                # evita que o modelo condicione no texto anterior e entre em loops tipo "Sum of Sum of..."
+                condition_on_previous_text=False,
+                # descarta segmentos com compressão suspeita (sintoma clássico de loop) e baixa confiança
+                compression_ratio_threshold=2.2,
+                logprob_threshold=-1.0,
+                no_speech_threshold=0.6,
+                temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
             )
 
-        en = str(result["text"]).strip()
+        en = str(result["text"])
+        # remove tokens especiais tipo [BLANK_AUDIO], [MUSIC], (inaudible), etc.
+        en = re.sub(r"[\[(][^)\]]*[\])]", "", en).strip()
         if not en:
             continue
 
