@@ -13,6 +13,7 @@ import scipy.io.wavfile as wav
 import sounddevice as sd
 import mlx_whisper
 from deep_translator import GoogleTranslator
+from translate import Translator as MyMemoryTranslator
 
 DEVICE = "BlackHole 2ch"
 SAMPLE_RATE = 16000
@@ -20,9 +21,17 @@ CHUNK_SECONDS = 5
 MODEL_REPO = "mlx-community/whisper-small-mlx"
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 8765
+TRANSLATOR_BACKEND = "mymemory"  # "google" | "mymemory"
 
 audio_q: queue.Queue[np.ndarray] = queue.Queue()
-translator = GoogleTranslator(source="en", target="pt")
+google_translator = GoogleTranslator(source="en", target="pt")
+mymemory_translator = MyMemoryTranslator(from_lang="en", to_lang="pt-BR")
+
+
+def translate_text(text: str) -> str:
+    if TRANSLATOR_BACKEND == "mymemory":
+        return mymemory_translator.translate(text)
+    return google_translator.translate(text)
 
 
 def is_hallucination(text: str) -> bool:
@@ -321,7 +330,7 @@ def worker():
             continue
 
         try:
-            pt = translator.translate(en)
+            pt = translate_text(en)
         except Exception as e:
             pt = f"[erro tradução: {e}]"
 
