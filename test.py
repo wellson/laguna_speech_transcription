@@ -2,14 +2,12 @@ import json
 import queue
 import re
 import sys
-import tempfile
 import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
-import scipy.io.wavfile as wav
 import sounddevice as sd
 import mlx_whisper
 from deep_translator import GoogleTranslator
@@ -17,30 +15,71 @@ from translate import Translator as MyMemoryTranslator
 
 DEVICE = "BlackHole 2ch"
 SAMPLE_RATE = 16000
-CHUNK_SECONDS = 5
-MODEL_REPO = "mlx-community/whisper-small-mlx"
+CHUNK_SECONDS = 3
+MODEL_REPO = "mlx-community/whisper-base.en-mlx"
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 8765
-TRANSLATOR_BACKEND = "mymemory"  # "google" | "mymemory"
+TRANSLATOR_BACKEND = "google"  # "google" | "mymemory"
 
 audio_q: queue.Queue[np.ndarray] = queue.Queue()
+translate_q: queue.Queue = queue.Queue()
 google_translator = GoogleTranslator(source="en", target="pt")
 mymemory_translator = MyMemoryTranslator(from_lang="en", to_lang="pt-BR")
 
 
+def _is_bad_translation(original: str, translated: str) -> bool:
+    if not translated:
+        return True
+    t = translated.strip()
+    if not t:
+        return True
+    # MyMemory devolve mensagens crus tipo "MYMEMORY WARNING: ...", "PLEASE SELECT TWO DISTINCT LANGUAGES",
+    # ou ecos com marcador de idioma ("EN>> ...", "PT-BR>> ..."), principalmente após estourar cota.
+    upper = t.upper()
+    bad_markers = ("MYMEMORY WARNING", "PLEASE SELECT TWO DISTINCT LANGUAGES", "INVALID", "QUERY LENGTH LIMIT")
+    if any(m in upper for m in bad_markers):
+        return True
+    if re.match(r"^[A-Z-]{2,6}>>\s*", t):
+        return True
+    # mesma string que entrou = não traduziu
+    if t.strip().lower() == original.strip().lower():
+        return True
+    return False
+
+
 def translate_text(text: str) -> str:
     if TRANSLATOR_BACKEND == "mymemory":
-        return mymemory_translator.translate(text)
+        try:
+            pt = mymemory_translator.translate(text)
+        except Exception:
+            pt = ""
+        if _is_bad_translation(text, pt):
+            # fallback automático para o Google quando o MyMemory devolve lixo/cota
+            return google_translator.translate(text)
+        return pt
     return google_translator.translate(text)
 
 
-def is_hallucination(text: str) -> bool:
-    """Detecta loops típicos de Whisper ('Sum of Sum of...', 'make sure that we make sure...').
+# frases curtas que o Whisper "alucina" em silêncio/ruído baixo — vêm dos dados de treino (YouTube)
+HALLUCINATION_PHRASES = {
+    "thank you.", "thank you", "thanks.", "thanks", "thanks for watching.",
+    "thanks for watching", "thank you for watching.", "thank you for watching",
+    "please subscribe.", "please subscribe", "subscribe.", "you", "you.",
+    "bye.", "bye", "bye-bye.", "bye-bye", "goodbye.", "goodbye",
+    ".", "okay.", "okay", "ok.", "ok", "yeah.", "yeah",
+    "...", "music", "applause", "silence",
+}
 
-    Critérios: baixa diversidade de palavras OU n-gramas curtos muito repetidos
-    OU repetição imediata consecutiva do mesmo trecho.
+
+def is_hallucination(text: str) -> bool:
+    """Detecta alucinações típicas do Whisper: frases curtas de silêncio ('Thank you.'),
+    loops ('Sum of Sum of...'), n-gramas repetidos e baixa diversidade.
     """
-    words = text.lower().split()
+    normalized = text.lower().strip()
+    if normalized in HALLUCINATION_PHRASES:
+        return True
+
+    words = normalized.split()
     if len(words) < 4:
         return False
 
@@ -298,30 +337,31 @@ def worker():
         if chunk is None:
             break
 
+        # gate de energia mais agressivo: silêncio/ruído baixo é a principal fonte
+        # de alucinação do Whisper ("Thank you.", "you", etc.)
         peak = float(np.max(np.abs(chunk)))
-        if peak < 1e-4:
+        rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
+        if peak < 0.01 or rms < 0.003:
             continue
 
-        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
-            wav.write(f.name, SAMPLE_RATE, chunk)
-            result = mlx_whisper.transcribe(
-                f.name,
-                path_or_hf_repo=MODEL_REPO,
-                language="en",
-                task="transcribe",
-                # não suprime nenhum token — mantém palavrões e gírias como falados
-                suppress_tokens=[],
-                # evita que o modelo condicione no texto anterior e entre em loops tipo "Sum of Sum of..."
-                condition_on_previous_text=False,
-                # descarta segmentos com compressão suspeita (sintoma clássico de loop) e baixa confiança
-                compression_ratio_threshold=2.2,
-                logprob_threshold=-1.0,
-                no_speech_threshold=0.6,
-                temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
-            )
+        # passa o numpy array direto pro whisper — evita o round-trip de escrever/ler .wav
+        audio_f32 = chunk.astype(np.float32).flatten()
+        result = mlx_whisper.transcribe(
+            audio_f32,
+            path_or_hf_repo=MODEL_REPO,
+            language="en",
+            task="transcribe",
+            suppress_tokens=[],
+            condition_on_previous_text=False,
+            compression_ratio_threshold=2.2,
+            logprob_threshold=-1.0,
+            no_speech_threshold=0.6,
+            # fallback curto: só retenta 1x se o segmento estourar threshold
+            temperature=(0.0, 0.4),
+            fp16=True,
+        )
 
         en = str(result["text"])
-        # remove tokens especiais tipo [BLANK_AUDIO], [MUSIC], (inaudible), etc.
         en = re.sub(r"[\[(][^)\]]*[\])]", "", en).strip()
         if not en:
             continue
@@ -329,6 +369,17 @@ def worker():
         if is_hallucination(en):
             continue
 
+        # publica o EN imediatamente e delega a tradução pro translator_worker —
+        # o próximo chunk pode começar a transcrever enquanto o Google traduz este
+        translate_q.put((en, time.time()))
+
+
+def translator_worker():
+    while True:
+        item = translate_q.get()
+        if item is None:
+            break
+        en, ts = item
         try:
             pt = translate_text(en)
         except Exception as e:
@@ -339,7 +390,7 @@ def worker():
             "type": "message",
             "en": en,
             "pt": pt,
-            "ts": time.time(),
+            "ts": ts,
         })
 
 
@@ -353,8 +404,8 @@ def main():
         pass
 
     print(f"Ouvindo {DEVICE} em chunks de {CHUNK_SECONDS}s. Ctrl+C para sair.")
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
+    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=translator_worker, daemon=True).start()
     try:
         recorder()
     except KeyboardInterrupt:
